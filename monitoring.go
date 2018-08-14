@@ -13,8 +13,7 @@ import (
 )
 
 const (
-	// HarvestorTick ...
-	HarvestorTick = 10
+	statsTick = 10
 )
 
 type containerMonitor struct {
@@ -53,7 +52,6 @@ func getContainerMonitor() *containerMonitor {
 	return cminstance
 }
 
-// New ...
 func New() *containerMonitor {
 
 	return getContainerMonitor()
@@ -135,12 +133,12 @@ func (ms *monitor) monitor(cli *client.Client) {
 	}()
 }
 
-func (cm *containerMonitor) harvestor() {
+func (cm *containerMonitor) collector() {
 
-	ticker := time.NewTicker(time.Second * HarvestorTick)
+	ticker := time.NewTicker(time.Second * statsTick)
 	go func() {
 		for t := range ticker.C {
-			log.Info("harvesting stats", t)
+			log.Info("Collecting stats: ", t)
 
 			for cid := range cm.monitorDb {
 				ms := cm.monitorDb[cid]
@@ -199,7 +197,7 @@ func Run() {
 
 	cm := New()
 	cm.monitorRunningContainers()
-	cm.harvestor()
+	cm.collector()
 
 	f := filters.NewArgs()
 	f.Add("type", "container")
