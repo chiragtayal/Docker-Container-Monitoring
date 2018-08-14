@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 
@@ -218,7 +217,7 @@ func Run() {
 			case "start":
 				cm.startMonitor(event.ID)
 			case "stop":
-				fmt.Println("..........Container dead CID : %s", event.ID)
+				log.Infof("..........Container dead CID : %s", event.ID)
 				if ms, ok := cm.monitorDb[event.ID]; ok {
 					ms.done <- true
 				}
