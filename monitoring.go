@@ -183,7 +183,7 @@ func (cm *containerMonitor) startMonitor(CID string) error {
 }
 
 func Run() {
-	log.Info("..........Starting Container Monitoring Service %s ...............", time.Now().String())
+	log.Info("...........Starting Container Monitoring Service: %s ", time.Now().String())
 
 	var client *client.Client
 	var err error
@@ -214,7 +214,7 @@ func Run() {
 			switch event.Status {
 			case "start":
 				cm.startMonitor(event.ID)
-			case "stop":
+			case "die":
 				log.Infof("..........Container dead CID : %s", event.ID)
 				if ms, ok := cm.monitorDb[event.ID]; ok {
 					ms.done <- true
