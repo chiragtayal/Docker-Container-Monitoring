@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"runtime/trace"
 	"sync"
 	"time"
+	//"unsafe"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	log "github.com/Sirupsen/logrus"
 )
 
 const (
@@ -18,52 +21,65 @@ const (
 
 type containerMonitor struct {
 	monitorDb map[string]*monitor
-	lock      *sync.Mutex
+	lock      sync.Mutex
 }
 
 type monitor struct {
-	stats   chan *types.StatsJSON
+	stats   chan types.StatsJSON
 	done    chan bool
 	cid     string
 	stopped bool
 }
 
-var cminstance *containerMonitor
-var cmonce sync.Once
+func (ms *monitor) monitor(cli *client.Client) {
 
-func getDockerClient() (*client.Client, error) {
-
-	return client.NewClient("unix:///var/run/docker.sock", "v1.18", nil,
-		map[string]string{"User-Agent": "engine-api-cli-1.0"})
-}
-
-func getContainerMonitor() *containerMonitor {
-
-	cmonce.Do(func() {
-
-		log.Info("Creating Container Monitor Instance")
-
-		cminstance = &containerMonitor{}
-		cminstance.lock = &sync.Mutex{}
-		cminstance.monitorDb = make(map[string]*monitor)
-
-	})
-
-	return cminstance
-}
-
-func New() *containerMonitor {
-
-	return getContainerMonitor()
-
-}
-
-func (cm *containerMonitor) monitorRunningContainers() {
-
-	client, err := getDockerClient()
+	stats, err := cli.ContainerStats(context.Background(), ms.cid, true)
 	if err != nil {
+		log.Errorf("Unable to gather stats for %s container, reason: %s", ms.cid, err.Error())
+		ms.stopped = true
 		return
 	}
+
+	dec := json.NewDecoder(stats.Body)
+
+	go func() {
+		log.Info("Start Monitoring for Container : ", ms.cid)
+		for {
+			select {
+			case <-ms.done:
+				log.Error("End Monitoring for Container : ", ms.cid)
+				stats.Body.Close()
+				ms.stopped = true
+				return
+			default:
+				var v types.StatsJSON
+				if err := dec.Decode(&v); err != nil {
+					log.Error("Unable to decode stats : ", err.Error())
+					ms.stopped = true
+					return
+				}
+				//log.Infof("Size of paypload: %d", unsafe.Sizeof(v))
+				ms.stats <- v
+			}
+		}
+	}()
+}
+
+func (cm *containerMonitor) startMonitor(client *client.Client, CID string) {
+
+	ms := monitor{
+		stats: make(chan types.StatsJSON),
+		done:  make(chan bool),
+		cid:   CID,
+	}
+	defer cm.lock.Unlock()
+	cm.lock.Lock()
+	cm.monitorDb[CID] = &ms
+
+	ms.monitor(client)
+}
+
+func (cm *containerMonitor) monitorRunningContainers(client *client.Client) {
 
 	containers, err := client.ContainerList(context.Background(), types.ContainerListOptions{})
 	if err != nil {
@@ -71,66 +87,8 @@ func (cm *containerMonitor) monitorRunningContainers() {
 	}
 
 	for _, container := range containers {
-
-		ms := &monitor{}
-		ms.stats = make(chan *types.StatsJSON)
-		ms.done = make(chan bool)
-		ms.cid = container.ID
-
-		cm.lock.Lock()
-		cm.monitorDb[container.ID] = ms
-		cm.lock.Unlock()
-
-		go ms.monitor(client)
+		cm.startMonitor(client, container.ID)
 	}
-}
-
-func (ms *monitor) monitor(cli *client.Client) {
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	stats, err := cli.ContainerStats(ctx, ms.cid, true)
-	if err != nil {
-		log.Errorf("%s", err.Error())
-	}
-
-	dec := json.NewDecoder(stats.Body)
-	var v *types.StatsJSON
-
-	go func() {
-		log.Info("Start Monitoring for Container : ", ms.cid)
-
-		for {
-			select {
-			case <-ctx.Done():
-				log.Error("Context canceled : ", ms.cid)
-				stats.Body.Close()
-				ms.stopped = true
-				close(ms.stats)
-				close(ms.done)
-				cancel()
-				return
-			case <-ms.done:
-				log.Error("End Monitoring for Container : ", ms.cid)
-				stats.Body.Close()
-				ms.stopped = true
-				close(ms.stats)
-				close(ms.done)
-				cancel()
-				return
-			default:
-				if err := dec.Decode(&v); err != nil {
-					log.Error("Unable to decode stats : ", err.Error())
-					ms.stopped = true
-					close(ms.stats)
-					close(ms.done)
-					cancel()
-					return
-				}
-				ms.stats <- v
-			}
-		}
-	}()
 }
 
 func (cm *containerMonitor) collector() {
@@ -158,45 +116,34 @@ func (cm *containerMonitor) collector() {
 	}()
 }
 
-func (cm *containerMonitor) startMonitor(CID string) error {
+func New() *containerMonitor {
 
-	var client *client.Client
-	var err error
+	var cminstance containerMonitor
 
-	if client, err = getDockerClient(); err != nil {
-		log.Error("Failed to get docker client : ", err)
-		return err
+	log.Info("Creating Container Monitor Instance")
+
+	cminstance = containerMonitor{
+		monitorDb: make(map[string]*monitor),
 	}
 
-	ms := &monitor{}
-	ms.stats = make(chan *types.StatsJSON)
-	ms.done = make(chan bool)
-	ms.cid = CID
-
-	defer cm.lock.Unlock()
-	cm.lock.Lock()
-	cm.monitorDb[CID] = ms
-
-	go ms.monitor(client)
-
-	return nil
+	return &cminstance
 }
 
 func Run() {
 	log.Info("...........Starting Container Monitoring Service: %s ", time.Now().String())
 
-	var client *client.Client
+	var dclient *client.Client
 	var err error
 
-	if client, err = getDockerClient(); err != nil {
-		for err != nil {
-			client, err = getDockerClient()
-			time.Sleep(time.Minute * 1)
-		}
+	dclient, err = client.NewClient("unix:///var/run/docker.sock", "v1.18", nil,
+		map[string]string{"User-Agent": "engine-api-cli-1.0"})
+	if err != nil {
+		log.Errorf("Unable to create docker client: %v", err)
+		return
 	}
 
 	cm := New()
-	cm.monitorRunningContainers()
+	cm.monitorRunningContainers(dclient)
 	cm.collector()
 
 	f := filters.NewArgs()
@@ -205,7 +152,7 @@ func Run() {
 		Filters: f,
 	}
 
-	listener, errorChan := client.Events(context.Background(), options)
+	listener, errorChan := dclient.Events(context.Background(), options)
 	for {
 		select {
 		case merr := <-errorChan:
@@ -213,7 +160,7 @@ func Run() {
 		case event := <-listener:
 			switch event.Status {
 			case "start":
-				cm.startMonitor(event.ID)
+				cm.startMonitor(dclient, event.ID)
 			case "die":
 				log.Infof("..........Container dead CID : %s", event.ID)
 				if ms, ok := cm.monitorDb[event.ID]; ok {
@@ -225,5 +172,8 @@ func Run() {
 }
 
 func main() {
+	trace.Start(os.Stdout)
+	defer trace.Stop()
+
 	Run()
 }
